@@ -22,6 +22,14 @@ PORT=3019 node server.js
 - `POST /issues`
 - `PATCH /issues/:id/status`
 
+## 区间与问题的状态约束
+
+- 区间还有未解决问题（`status != "resolved"`）时，`PATCH /sections/:id/check` 标记已校对返回 `409`，区间保持 `checked: false`。
+- 关闭区间最后一个未解决问题时，区间自动变为 `checked: true`。
+- 重新打开任一已解决问题（状态改为非 `resolved`）时，区间自动变回 `checked: false`；在已校对区间新建问题同样会使其失效。
+- 手工取消校对（`checked: false`）只改区间状态，不会重开任何已解决问题。
+- 所有写操作串行执行且落盘为原子写，并发更新不会互相覆盖。
+
 ## 闭环示例
 
 ```bash

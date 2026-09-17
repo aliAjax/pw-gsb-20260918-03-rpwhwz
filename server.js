@@ -1,5 +1,5 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, rename, mkdir } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3019);
@@ -75,7 +75,7 @@ async function ensureDb() {
   try {
     JSON.parse(await readFile(DB_FILE, "utf8"));
   } catch {
-    await writeFile(DB_FILE, JSON.stringify(initialData, null, 2));
+    await writeDb(initialData);
   }
 }
 
@@ -85,7 +85,17 @@ async function readDb() {
 }
 
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  const tmpFile = `${DB_FILE}.${process.pid}.tmp`;
+  await writeFile(tmpFile, JSON.stringify(data, null, 2));
+  await rename(tmpFile, DB_FILE);
+}
+
+// 串行化所有“读-改-写”变更，避免并发请求互相覆盖状态
+let dbQueue = Promise.resolve();
+function withDbLock(task) {
+  const result = dbQueue.then(() => task());
+  dbQueue = result.catch(() => {});
+  return result;
 }
 
 function send(res, status, body) {
@@ -134,12 +144,20 @@ function findTune(db, tuneId) {
   return tune;
 }
 
+function isResolved(issue) {
+  return issue.status === "resolved";
+}
+
+function openIssuesOf(db, sectionId) {
+  return db.issues.filter((item) => item.sectionId === sectionId && !isResolved(item));
+}
+
 function buildProgress(db, tuneId) {
   findTune(db, tuneId);
   const sections = db.sections.filter((item) => item.tuneId === tuneId);
   const issues = db.issues.filter((item) => item.tuneId === tuneId);
   const checkedCount = sections.filter((item) => item.checked).length;
-  const openIssues = issues.filter((item) => item.status !== "resolved").length;
+  const openIssues = issues.filter((item) => !isResolved(item)).length;
   return {
     tuneId,
     totalSections: sections.length,
@@ -153,13 +171,13 @@ function buildProgress(db, tuneId) {
 
 async function handle(req, res) {
   const { pathname, searchParams } = parseUrl(req);
-  const db = await readDb();
 
   if (req.method === "GET" && pathname === "/health") {
     return send(res, 200, { ok: true, service: "organ-strip-punch-api", routes });
   }
 
   if (req.method === "GET" && pathname === "/tunes") {
+    const db = await readDb();
     const tunes = db.tunes.map((tune) => ({ ...tune, progress: buildProgress(db, tune.id) }));
     return send(res, 200, { data: tunes });
   }
@@ -167,70 +185,95 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/tunes") {
     const body = await parseBody(req);
     required(body, ["title", "stripSpec"]);
-    const tune = {
-      id: makeId("tune"),
-      title: body.title,
-      composer: body.composer || "",
-      stripSpec: body.stripSpec,
-      createdAt: new Date().toISOString()
-    };
-    db.tunes.push(tune);
-    await writeDb(db);
-    return send(res, 201, { data: tune });
+    return withDbLock(async () => {
+      const db = await readDb();
+      const tune = {
+        id: makeId("tune"),
+        title: body.title,
+        composer: body.composer || "",
+        stripSpec: body.stripSpec,
+        createdAt: new Date().toISOString()
+      };
+      db.tunes.push(tune);
+      await writeDb(db);
+      return send(res, 201, { data: tune });
+    });
   }
 
   const tuneSectionsMatch = pathname.match(/^\/tunes\/([^/]+)\/sections$/);
   if (tuneSectionsMatch && req.method === "GET") {
     const tuneId = tuneSectionsMatch[1];
+    const db = await readDb();
     findTune(db, tuneId);
     return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId) });
   }
 
   if (tuneSectionsMatch && req.method === "POST") {
     const tuneId = tuneSectionsMatch[1];
-    findTune(db, tuneId);
     const body = await parseBody(req);
     required(body, ["startBeat", "endBeat", "laneRange"]);
-    const section = {
-      id: makeId("section"),
-      tuneId,
-      startBeat: Number(body.startBeat),
-      endBeat: Number(body.endBeat),
-      laneRange: body.laneRange,
-      checked: Boolean(body.checked),
-      note: body.note || ""
-    };
-    db.sections.push(section);
-    await writeDb(db);
-    return send(res, 201, { data: section });
+    return withDbLock(async () => {
+      const db = await readDb();
+      findTune(db, tuneId);
+      const section = {
+        id: makeId("section"),
+        tuneId,
+        startBeat: Number(body.startBeat),
+        endBeat: Number(body.endBeat),
+        laneRange: body.laneRange,
+        checked: Boolean(body.checked),
+        note: body.note || ""
+      };
+      db.sections.push(section);
+      await writeDb(db);
+      return send(res, 201, { data: section });
+    });
   }
 
   const uncheckedMatch = pathname.match(/^\/tunes\/([^/]+)\/unchecked-sections$/);
   if (uncheckedMatch && req.method === "GET") {
     const tuneId = uncheckedMatch[1];
+    const db = await readDb();
     findTune(db, tuneId);
     return send(res, 200, { data: db.sections.filter((item) => item.tuneId === tuneId && !item.checked) });
   }
 
   const progressMatch = pathname.match(/^\/tunes\/([^/]+)\/progress$/);
   if (progressMatch && req.method === "GET") {
+    const db = await readDb();
     return send(res, 200, { data: buildProgress(db, progressMatch[1]) });
   }
 
   const checkMatch = pathname.match(/^\/sections\/([^/]+)\/check$/);
   if (checkMatch && req.method === "PATCH") {
-    const section = db.sections.find((item) => item.id === checkMatch[1]);
-    if (!section) return send(res, 404, { error: "区间不存在" });
     const body = await parseBody(req);
-    section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
-    section.note = body.note ?? section.note;
-    await writeDb(db);
-    return send(res, 200, { data: section });
+    return withDbLock(async () => {
+      const db = await readDb();
+      const section = db.sections.find((item) => item.id === checkMatch[1]);
+      if (!section) return send(res, 404, { error: "区间不存在" });
+      const checked = body.checked !== undefined ? Boolean(body.checked) : true;
+      if (checked) {
+        const openIssues = openIssuesOf(db, section.id);
+        if (openIssues.length) {
+          return send(res, 409, {
+            error: "区间还有未解决问题，无法标记为已校对",
+            openIssues: openIssues.length,
+            openIssueIds: openIssues.map((item) => item.id)
+          });
+        }
+      }
+      // 手工取消校对只改 checked，不重开任何已解决问题
+      section.checked = checked;
+      section.note = body.note ?? section.note;
+      await writeDb(db);
+      return send(res, 200, { data: section });
+    });
   }
 
   if (req.method === "GET" && pathname === "/issues") {
     const tuneId = searchParams.get("tuneId");
     const status = searchParams.get("status");
+    const db = await readDb();
     const issues = db.issues.filter((item) => (!tuneId || item.tuneId === tuneId) && (!status || item.status === status));
     return send(res, 200, { data: issues });
   }
@@ -238,37 +281,57 @@ async function handle(req, res) {
   if (req.method === "POST" && pathname === "/issues") {
     const body = await parseBody(req);
     required(body, ["tuneId", "sectionId", "type", "description"]);
-    findTune(db, body.tuneId);
-    const section = db.sections.find((item) => item.id === body.sectionId && item.tuneId === body.tuneId);
-    if (!section) return send(res, 400, { error: "区间不存在或不属于该曲目" });
-    const issue = {
-      id: makeId("issue"),
-      tuneId: body.tuneId,
-      sectionId: body.sectionId,
-      type: body.type,
-      beat: body.beat === undefined ? null : Number(body.beat),
-      lane: body.lane === undefined ? null : Number(body.lane),
-      description: body.description,
-      status: "open",
-      createdAt: new Date().toISOString(),
-      resolvedAt: null
-    };
-    db.issues.push(issue);
-    await writeDb(db);
-    return send(res, 201, { data: issue });
+    return withDbLock(async () => {
+      const db = await readDb();
+      findTune(db, body.tuneId);
+      const section = db.sections.find((item) => item.id === body.sectionId && item.tuneId === body.tuneId);
+      if (!section) return send(res, 400, { error: "区间不存在或不属于该曲目" });
+      const issue = {
+        id: makeId("issue"),
+        tuneId: body.tuneId,
+        sectionId: body.sectionId,
+        type: body.type,
+        beat: body.beat === undefined ? null : Number(body.beat),
+        lane: body.lane === undefined ? null : Number(body.lane),
+        description: body.description,
+        status: "open",
+        createdAt: new Date().toISOString(),
+        resolvedAt: null
+      };
+      db.issues.push(issue);
+      // 新的未解决问题使该区间的校对失效
+      section.checked = false;
+      await writeDb(db);
+      return send(res, 201, { data: issue });
+    });
   }
 
   const issueStatusMatch = pathname.match(/^\/issues\/([^/]+)\/status$/);
   if (issueStatusMatch && req.method === "PATCH") {
-    const issue = db.issues.find((item) => item.id === issueStatusMatch[1]);
-    if (!issue) return send(res, 404, { error: "问题不存在" });
     const body = await parseBody(req);
     required(body, ["status"]);
-    issue.status = body.status;
-    issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
-    issue.note = body.note ?? issue.note;
-    await writeDb(db);
-    return send(res, 200, { data: issue });
+    return withDbLock(async () => {
+      const db = await readDb();
+      const issue = db.issues.find((item) => item.id === issueStatusMatch[1]);
+      if (!issue) return send(res, 404, { error: "问题不存在" });
+      const wasResolved = isResolved(issue);
+      const nowResolved = body.status === "resolved";
+      issue.status = body.status;
+      issue.resolvedAt = nowResolved ? new Date().toISOString() : null;
+      issue.note = body.note ?? issue.note;
+      const section = db.sections.find((item) => item.id === issue.sectionId);
+      if (section) {
+        if (!wasResolved && nowResolved) {
+          // 关闭区间最后一个未解决问题时，自动把区间设为已校对
+          if (openIssuesOf(db, section.id).length === 0) section.checked = true;
+        } else if (wasResolved && !nowResolved) {
+          // 重新打开任一已解决问题时，自动改回未校对
+          section.checked = false;
+        }
+      }
+      await writeDb(db);
+      return send(res, 200, { data: issue });
+    });
   }
 
   return send(res, 404, { error: "接口不存在", routes });
