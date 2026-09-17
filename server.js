@@ -1,5 +1,5 @@
 const http = require("http");
-const { readFile, writeFile, mkdir } = require("fs/promises");
+const { readFile, writeFile, mkdir, rename } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3019);
@@ -84,8 +84,34 @@ async function readDb() {
   return JSON.parse(await readFile(DB_FILE, "utf8"));
 }
 
+// 进程内互斥锁：把所有请求的“读-改-写”串行化，
+// 保证并发 PATCH 不会基于同一份旧快照互相覆盖。
+let writeChain = Promise.resolve();
+function withLock(task) {
+  const result = writeChain.then(task, task);
+  // 锁本身不能因为单个任务失败而断裂
+  writeChain = result.then(
+    () => undefined,
+    () => undefined
+  );
+  return result;
+}
+
 async function writeDb(data) {
-  await writeFile(DB_FILE, JSON.stringify(data, null, 2));
+  const tmpFile = `${DB_FILE}.${process.pid}.${Date.now().toString(36)}.${Math.random()
+    .toString(36)
+    .slice(2, 8)}.tmp`;
+  await writeFile(tmpFile, JSON.stringify(data, null, 2));
+  await rename(tmpFile, DB_FILE);
+}
+
+// 未解决问题的判定口径与 buildProgress 保持一致：status 不是 resolved 即未解决
+function isOpenIssue(issue) {
+  return issue.status !== "resolved";
+}
+
+function findOpenIssues(db, sectionId) {
+  return db.issues.filter((item) => item.sectionId === sectionId && isOpenIssue(item));
 }
 
 function send(res, status, body) {
@@ -222,7 +248,27 @@ async function handle(req, res) {
     const section = db.sections.find((item) => item.id === checkMatch[1]);
     if (!section) return send(res, 404, { error: "区间不存在" });
     const body = await parseBody(req);
-    section.checked = body.checked !== undefined ? Boolean(body.checked) : true;
+    const nextChecked = body.checked !== undefined ? Boolean(body.checked) : true;
+
+    // 双向约束：只有在 unchecked -> checked 时拦截。
+    // 已处于 checked 的重复请求视为幂等操作，不与历史数据对抗。
+    if (nextChecked && !section.checked) {
+      const openIssues = findOpenIssues(db, section.id);
+      if (openIssues.length) {
+        // 不写库：区间保持 unchecked，备注也不落库，问题状态一律不动
+        return send(res, 409, {
+          error: "区间仍有未解决问题，无法标记为已校对",
+          data: {
+            sectionId: section.id,
+            checked: section.checked,
+            openIssueCount: openIssues.length,
+            openIssueIds: openIssues.map((item) => item.id)
+          }
+        });
+      }
+    }
+
+    section.checked = nextChecked;
     section.note = body.note ?? section.note;
     await writeDb(db);
     return send(res, 200, { data: section });
@@ -254,6 +300,8 @@ async function handle(req, res) {
       resolvedAt: null
     };
     db.issues.push(issue);
+    // 双向约束：出现新的未解决问题，区间不可能仍是已校对状态
+    section.checked = false;
     await writeDb(db);
     return send(res, 201, { data: issue });
   }
@@ -264,9 +312,26 @@ async function handle(req, res) {
     if (!issue) return send(res, 404, { error: "问题不存在" });
     const body = await parseBody(req);
     required(body, ["status"]);
+
+    const wasOpen = isOpenIssue(issue);
     issue.status = body.status;
     issue.resolvedAt = body.status === "resolved" ? new Date().toISOString() : null;
     issue.note = body.note ?? issue.note;
+
+    // 双向约束：跟随问题状态联动区间校对标记
+    const section = db.sections.find((item) => item.id === issue.sectionId);
+    if (section) {
+      if (wasOpen && !isOpenIssue(issue)) {
+        // 本问题被关闭：若它是区间最后一个未解决问题，区间自动变为 checked
+        if (findOpenIssues(db, section.id).length === 0) {
+          section.checked = true;
+        }
+      } else if (!wasOpen && isOpenIssue(issue)) {
+        // 已解决问题被重新打开：区间自动改回 unchecked
+        section.checked = false;
+      }
+    }
+
     await writeDb(db);
     return send(res, 200, { data: issue });
   }
@@ -275,7 +340,9 @@ async function handle(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  handle(req, res).catch((error) => send(res, error.status || 500, { error: error.message || "服务器错误" }));
+  withLock(() => handle(req, res)).catch((error) =>
+    send(res, error.status || 500, { error: error.message || "服务器错误" })
+  );
 });
 
 server.listen(PORT, () => {
